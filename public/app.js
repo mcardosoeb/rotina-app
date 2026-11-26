@@ -197,7 +197,8 @@ function autoType(k) {
 // Estado + sincronização
 // ------------------------------------------------------------------
 const LS_STATE = 'rotina_state_v1';
-const LS_PIN = 'rotina_pin';
+// Versões antigas guardavam o PIN no aparelho; agora o login usa sessão em cookie HttpOnly
+localStorage.removeItem('rotina_pin');
 
 function emptyState() {
   return { version: 1, updatedAt: 0, settings: { ...DEFAULTS }, days: {}, weights: [] };
@@ -239,12 +240,12 @@ function save() {
 }
 
 function headers() {
-  return { 'Content-Type': 'application/json', 'x-pin': localStorage.getItem(LS_PIN) || '' };
+  return { 'Content-Type': 'application/json' };
 }
 
 async function push() {
   try {
-    const r = await fetch('/api/state', { method: 'PUT', headers: headers(), body: JSON.stringify({ state }) });
+    const r = await fetch('/api/state', { method: 'PUT', headers: headers(), body: JSON.stringify({ state }), credentials: 'same-origin' });
     if (r.status === 401) { showPin(); return; }
     if (!r.ok) throw new Error();
     dirty = false;
@@ -258,7 +259,7 @@ async function push() {
 
 async function pull() {
   try {
-    const r = await fetch('/api/state', { headers: headers() });
+    const r = await fetch('/api/state', { headers: headers(), credentials: 'same-origin' });
     if (r.status === 401) { showPin(); return false; }
     if (!r.ok) throw new Error();
     const { state: server } = await r.json();
@@ -291,31 +292,86 @@ function setSync(s) {
 // PIN
 // ------------------------------------------------------------------
 function showPin(msg) {
+  document.body.classList.add('locked');
   document.getElementById('pinModal').classList.remove('hidden');
   document.getElementById('pinError').textContent = msg || '';
+  document.getElementById('pinInput').value = '';
   setTimeout(() => document.getElementById('pinInput').focus(), 50);
+}
+
+function hidePin() {
+  document.body.classList.remove('locked');
+  document.getElementById('pinModal').classList.add('hidden');
 }
 
 async function checkAuth() {
   try {
-    const r = await fetch('/api/auth', { headers: headers() });
+    const r = await fetch('/api/auth', { credentials: 'same-origin' });
     const a = await r.json();
-    if (a.pinRequired && !a.ok) { showPin(localStorage.getItem(LS_PIN) ? 'PIN incorreto.' : ''); return false; }
+    if (r.status === 503) { showPin('Servidor sem PIN configurado (variável APP_PIN).'); return false; }
+    if (!a.ok) { showPin(); return false; }
     return true;
   } catch {
-    return true; // offline: segue com dados locais
+    return true; // offline: segue com os dados do aparelho
   }
 }
 
+function fmtWait(sec) {
+  return sec >= 3600 ? `${Math.ceil(sec / 3600)} h` : sec >= 60 ? `${Math.ceil(sec / 60)} min` : `${sec} s`;
+}
+
+let loggingIn = false;
 document.getElementById('pinOk').onclick = async () => {
-  localStorage.setItem(LS_PIN, document.getElementById('pinInput').value.trim());
-  if (await checkAuth()) {
-    document.getElementById('pinModal').classList.add('hidden');
-    await pull();
-    render();
+  if (loggingIn) return;
+  const pin = document.getElementById('pinInput').value.trim();
+  const remember = document.getElementById('pinRemember').checked;
+  if (!pin) return;
+  loggingIn = true;
+  document.getElementById('pinOk').disabled = true;
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST', headers: headers(), credentials: 'same-origin', body: JSON.stringify({ pin, remember }),
+    });
+    const a = await r.json().catch(() => ({}));
+    if (r.ok) {
+      hidePin();
+      await pull();
+      render();
+    } else if (r.status === 429) {
+      showPin(`Muitas tentativas erradas. Tente de novo em ${fmtWait(a.retryAfter || 900)}.`);
+    } else if (r.status === 401) {
+      showPin(a.attemptsLeft > 0 ? `PIN incorreto. ${a.attemptsLeft} tentativa(s) antes do bloqueio.` : 'PIN incorreto.');
+    } else if (r.status === 503) {
+      showPin('Servidor sem PIN configurado (variável APP_PIN).');
+    } else {
+      showPin('Erro ao entrar. Tente de novo.');
+    }
+  } catch {
+    showPin('Sem internet. Conecte-se para entrar.');
+  } finally {
+    loggingIn = false;
+    document.getElementById('pinOk').disabled = false;
   }
 };
 document.getElementById('pinInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') document.getElementById('pinOk').click(); });
+
+// Sair: envia o que falta, encerra a sessão e apaga a cópia dos dados deste aparelho
+async function logout(all) {
+  const msg = all
+    ? 'Sair de TODOS os aparelhos? Todos vão pedir o PIN de novo. Os dados deste aparelho serão apagados (continuam no servidor).'
+    : 'Sair deste aparelho? Os dados daqui serão apagados (continuam no servidor) e o PIN será pedido de novo.';
+  if (!confirm(msg)) return;
+  if (dirty) await push();
+  if (dirty && !confirm('Há alterações que ainda não foram enviadas ao servidor e serão perdidas. Sair mesmo assim?')) return;
+  try {
+    await fetch(all ? '/api/logout-all' : '/api/logout', { method: 'POST', headers: headers(), credentials: 'same-origin' });
+  } catch { /* offline: o cookie expira sozinho */ }
+  localStorage.removeItem(LS_STATE);
+  state = emptyState();
+  dirty = false;
+  setTab('hoje');
+  showPin();
+}
 
 // ------------------------------------------------------------------
 // Cálculos
@@ -746,7 +802,10 @@ function renderAjustes() {
       <div class="small muted" style="margin-top:8px">Status: ${online ? 'sincronizado com o servidor' : 'offline — dados salvos no celular'}.</div>
     </div>
     <div class="card"><h3>Sessão</h3>
-      <button class="btn danger block" id="sLogout">Sair (pedir PIN de novo)</button>
+      <button class="btn danger block" id="sLogout">Sair deste aparelho</button>
+      <div style="height:8px"></div>
+      <button class="btn danger block" id="sLogoutAll">Sair de todos os aparelhos</button>
+      <div class="small muted" style="margin-top:8px">Use "todos os aparelhos" se perdeu o celular ou acha que alguém viu seu PIN. Depois troque o APP_PIN no Railway.</div>
     </div>
     <button class="btn block" id="sBack">‹ Voltar</button>
   `;
@@ -776,7 +835,8 @@ function renderAjustes() {
       save(); toast('Backup importado'); setTab('hoje');
     } catch { toast('Arquivo inválido'); }
   };
-  document.getElementById('sLogout').onclick = () => { localStorage.removeItem(LS_PIN); showPin(); };
+  document.getElementById('sLogout').onclick = () => logout(false);
+  document.getElementById('sLogoutAll').onclick = () => logout(true);
   document.getElementById('sBack').onclick = () => setTab('hoje');
 }
 
