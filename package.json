@@ -1,0 +1,14 @@
+{
+  "name": "rotina-pmsc",
+  "version": "1.0.0",
+  "description": "App pessoal de rotina, estudos, treino, calorias e peso",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
