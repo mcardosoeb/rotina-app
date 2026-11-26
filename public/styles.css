@@ -149,6 +149,13 @@ pre.checkin { background: var(--card2); border-radius: 12px; padding: 12px; whit
 .remember { display: flex; align-items: center; gap: 8px; margin: 2px 0 6px; font-size: 14px; }
 .remember input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
 body.locked #view { visibility: hidden; }
+.modal-card { max-height: calc(100vh - 40px); overflow-y: auto; }
+.auth-msg { color: var(--warn); min-height: 1em; margin: 4px 0 10px; }
+.setup-steps { padding-left: 18px; margin: 0 0 12px; line-height: 1.5; }
+.setup-steps li { margin-bottom: 8px; }
+.secret { display: block; font: 15px/1.4 ui-monospace, Menlo, monospace; background: var(--card2); border-radius: 8px; padding: 8px; margin: 6px 0; word-break: break-all; user-select: all; -webkit-user-select: all; }
+.recovery { text-align: center; font-size: 17px; letter-spacing: 1px; }
+a.btn { display: block; text-align: center; text-decoration: none; color: var(--text); }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--safe-bottom) + 88px); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 12px; font-weight: 600; z-index: 60; font-size: 14px; }
 .list-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
 .list-row:last-child { border-bottom: 0; }

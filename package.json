@@ -4,7 +4,8 @@
   "description": "App pessoal de rotina, estudos, treino, calorias e peso",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/security.js"
   },
   "engines": {
     "node": ">=18"

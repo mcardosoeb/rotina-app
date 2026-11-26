@@ -1,6 +1,6 @@
 // Service worker: guarda os arquivos do app para abrir offline.
 // Os dados (/api) nunca são cacheados aqui; o app guarda uma cópia local.
-const CACHE = 'rotina-v2';
+const CACHE = 'rotina-v3';
 const ASSETS = ['/', '/index.html', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-180.png', '/icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {

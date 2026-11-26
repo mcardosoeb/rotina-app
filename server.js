@@ -1,14 +1,15 @@
 // Rotina PMSC — servidor sem dependências (Node 18+)
-// Serve os arquivos de /public e guarda os dados em DATA_DIR/state.json
+// Serve os arquivos de /public e guarda os dados criptografados em DATA_DIR.
 //
 // Segurança:
-// - PIN obrigatório (APP_PIN). Sem PIN, a API fica bloqueada.
-// - Login troca o PIN por uma sessão em cookie HttpOnly (o PIN não fica salvo no celular).
-// - "Lembrar neste aparelho": sessão de 90 dias, renovada com o uso. Sem lembrar: 12 h e
-//   some ao fechar o app.
-// - Bloqueio de tentativas por IP e bloqueio geral contra ataques de vários IPs.
-// - Trocar o APP_PIN no Railway derruba todas as sessões.
-// - Cabeçalhos de segurança (CSP, HSTS, sem iframe, sem indexação).
+// - PIN obrigatório (APP_PIN) e chave de criptografia obrigatória (DATA_KEY). Sem elas, a API fica bloqueada.
+// - Tudo o que é salvo em disco (rotina, sessões, 2FA) é criptografado com AES-256-GCM.
+// - 2FA (código de 6 dígitos de app autenticador) no primeiro acesso de cada aparelho.
+//   Aparelho confirmado vira "confiável" (cookie de 1 ano): nas próximas vezes pede só o PIN.
+// - "Lembrar neste aparelho": sessão de 90 dias renovada com o uso. Sem lembrar: 12 h.
+// - Bloqueio de tentativas (PIN e código) por IP e geral.
+// - Trocar o APP_PIN derruba as sessões. "Sair de todos os aparelhos" derruba sessões e aparelhos confiáveis.
+// - RESET_2FA=1 (temporário) apaga o 2FA para configurar de novo, caso perca o autenticador e os códigos.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -17,26 +18,35 @@ const crypto = require('crypto');
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const APP_PIN = process.env.APP_PIN || '';
+const DATA_KEY = process.env.DATA_KEY || '';
+const RESET_2FA = /^(1|true|sim)$/i.test(process.env.RESET_2FA || '');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+const LEGACY_SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const MAX_BODY = 5 * 1024 * 1024; // 5 MB
 const MAX_LOGIN_BODY = 1024;
 
 const COOKIE = 'rotina_sid';
+const DEVICE_COOKIE = 'rotina_dev';
 const DAY = 24 * 60 * 60 * 1000;
 const REMEMBER_TTL = 90 * DAY;
 const SHORT_TTL = 12 * 60 * 60 * 1000;
+const DEVICE_TTL = 365 * DAY;
+const TICKET_TTL = 5 * 60 * 1000;
+const TICKET_MAX_TRIES = 5;
 const MAX_SESSIONS = 20;
+const MAX_DEVICES = 10;
+const RECOVERY_CODES = 8;
 
 // Bloqueio de tentativas
-const IP_MAX_FAILS = 5; // erros seguidos por IP antes de bloquear
-const IP_BASE_LOCK = 15 * 60 * 1000; // 15 min, dobra a cada novo bloqueio (máx. 24 h)
-const GLOBAL_WINDOW = 60 * 60 * 1000; // 1 h
-const GLOBAL_MAX_FAILS = 30; // erros somando todos os IPs na janela
+const IP_MAX_FAILS = 5;
+const IP_BASE_LOCK = 15 * 60 * 1000; // dobra a cada bloqueio (máx. 24 h)
+const GLOBAL_WINDOW = 60 * 60 * 1000;
+const GLOBAL_MAX_FAILS = 20;
 const GLOBAL_LOCK = 30 * 60 * 1000;
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -68,7 +78,6 @@ const SECURITY_HEADERS = {
 // Utilidades
 // ------------------------------------------------------------------
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
-// Identifica o PIN atual sem guardá-lo: trocar o PIN invalida as sessões antigas
 const PIN_ID = APP_PIN ? sha256('rotina-pin:' + APP_PIN).slice(0, 16) : '';
 
 function isHttps(req) {
@@ -78,6 +87,11 @@ function isHttps(req) {
 function send(req, res, status, body, headers = {}) {
   const h = { 'Cache-Control': 'no-store', ...SECURITY_HEADERS, ...headers };
   if (isHttps(req)) h['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
+  const extra = res.getHeader('Set-Cookie');
+  if (extra && h['Set-Cookie']) {
+    h['Set-Cookie'] = [].concat(extra, h['Set-Cookie']);
+    res.removeHeader('Set-Cookie');
+  }
   res.writeHead(status, h);
   res.end(body);
 }
@@ -87,8 +101,7 @@ function json(req, res, status, obj, headers = {}) {
 }
 
 function clientIp(req) {
-  // Railway fica atrás de proxy, que acrescenta o IP real no fim do X-Forwarded-For.
-  // Os primeiros valores podem ser forjados pelo cliente, então usamos o último.
+  // O proxy do Railway acrescenta o IP real no fim do X-Forwarded-For (os primeiros podem ser forjados)
   const fwd = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim();
   return fwd || req.socket.remoteAddress || 'unknown';
 }
@@ -97,33 +110,38 @@ function parseCookies(req) {
   const out = {};
   for (const part of String(req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i > 0) {
+      try {
+        out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+      } catch { /* cookie inválido */ }
+    }
   }
   return out;
 }
 
-function sessionCookie(req, token, maxAgeMs) {
-  const parts = [`${COOKIE}=${token}`, 'Path=/', 'HttpOnly', 'SameSite=Strict'];
+function cookie(req, name, value, maxAgeMs, cookiePath = '/') {
+  const parts = [`${name}=${value}`, `Path=${cookiePath}`, 'HttpOnly', 'SameSite=Strict'];
   if (isHttps(req)) parts.push('Secure');
   if (maxAgeMs != null) parts.push(`Max-Age=${Math.floor(maxAgeMs / 1000)}`);
   return parts.join('; ');
 }
 
-function clearCookie(req) {
-  return sessionCookie(req, '', 0);
+const sessionCookie = (req, token, ttl) => cookie(req, COOKIE, token, ttl);
+const clearSessionCookie = (req) => cookie(req, COOKIE, '', 0);
+const deviceCookie = (req, token) => cookie(req, DEVICE_COOKIE, token, DEVICE_TTL, '/api/');
+const clearDeviceCookie = (req) => cookie(req, DEVICE_COOKIE, '', 0, '/api/');
+
+function safeEqual(a, b) {
+  const x = crypto.createHash('sha256').update(String(a)).digest();
+  const y = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y);
 }
 
-function pinMatches(given) {
-  // Compara hashes de tamanho fixo: não vaza o tamanho do PIN nem o tempo de comparação
-  const a = crypto.createHash('sha256').update(String(given)).digest();
-  const b = crypto.createHash('sha256').update(APP_PIN).digest();
-  return crypto.timingSafeEqual(a, b);
-}
+const pinMatches = (given) => safeEqual(given, APP_PIN);
 
-// Bloqueia requisições que mudam dados vindas de outro site
 function sameOrigin(req) {
   const origin = req.headers.origin;
-  if (!origin) return true; // apps nativos/curl; o cookie SameSite=Strict já protege o navegador
+  if (!origin) return true; // o cookie SameSite=Strict já protege o navegador
   try {
     return new URL(origin).host === req.headers.host;
   } catch {
@@ -132,46 +150,175 @@ function sameOrigin(req) {
 }
 
 // ------------------------------------------------------------------
-// Dados
+// Criptografia em disco (AES-256-GCM)
 // ------------------------------------------------------------------
-function readJson(file) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return null;
-  }
+const KEY = DATA_KEY.length >= 32
+  ? Buffer.from(crypto.hkdfSync('sha256', DATA_KEY, 'rotina-pmsc', 'rotina-data-v1', 32))
+  : null;
+
+function encrypt(obj, aad) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', KEY, iv);
+  c.setAAD(Buffer.from(aad));
+  const data = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+  return { enc: 'aes-256-gcm', v: 1, iv: iv.toString('base64'), tag: c.getAuthTag().toString('base64'), data: data.toString('base64') };
 }
 
-function writeJson(file, obj) {
+function decrypt(box, aad) {
+  const d = crypto.createDecipheriv('aes-256-gcm', KEY, Buffer.from(box.iv, 'base64'));
+  d.setAAD(Buffer.from(aad));
+  d.setAuthTag(Buffer.from(box.tag, 'base64'));
+  return JSON.parse(Buffer.concat([d.update(Buffer.from(box.data, 'base64')), d.final()]).toString('utf8'));
+}
+
+function writeFileAtomic(file, text) {
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 });
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 
-// ------------------------------------------------------------------
-// Sessões (guardadas como hash do token: quem ler o arquivo não consegue entrar)
-// ------------------------------------------------------------------
-let sessions = loadSessions();
+// Lê um arquivo criptografado. Retorna { value, legacy } ou lança erro se a chave estiver errada.
+function readSecure(file, aad) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { value: null, legacy: false };
+  }
+  const parsed = JSON.parse(raw);
+  if (parsed && parsed.enc === 'aes-256-gcm') return { value: decrypt(parsed, aad), legacy: false };
+  return { value: parsed, legacy: true }; // arquivo antigo, sem criptografia
+}
 
-function loadSessions() {
-  const s = readJson(SESSIONS_FILE);
-  if (!s || s.pinId !== PIN_ID || !Array.isArray(s.list)) return []; // PIN trocado: derruba todos
+function writeSecure(file, aad, obj) {
+  writeFileAtomic(file, JSON.stringify(encrypt(obj, aad)));
+}
+
+// ------------------------------------------------------------------
+// Inicialização: valida a chave e migra arquivos antigos
+// ------------------------------------------------------------------
+let fatal = null; // 'no_pin' | 'no_key' | 'bad_key'
+let auth = null;
+
+function emptyAuth() {
+  return { v: 2, pinId: PIN_ID, totp: null, recovery: [], sessions: [], devices: [] };
+}
+
+function init() {
+  if (!APP_PIN) return (fatal = 'no_pin');
+  if (!KEY) return (fatal = 'no_key');
+  try {
+    const st = readSecure(STATE_FILE, 'state');
+    if (st.legacy && st.value) {
+      writeSecure(STATE_FILE, 'state', st.value);
+      if (JSON.stringify(readSecure(STATE_FILE, 'state').value) !== JSON.stringify(st.value)) throw new Error('migração falhou');
+      console.log('Dados antigos criptografados com sucesso.');
+    }
+    const a = readSecure(AUTH_FILE, 'auth');
+    auth = a.value && a.value.v === 2 ? a.value : emptyAuth();
+  } catch (e) {
+    console.error('ERRO: não foi possível ler os dados com a DATA_KEY atual. Nada será gravado até a chave correta voltar.', e.message);
+    return (fatal = 'bad_key');
+  }
+  try { fs.unlinkSync(LEGACY_SESSIONS_FILE); } catch { /* não existia */ }
+  if (auth.pinId !== PIN_ID) {
+    // PIN trocado: derruba sessões (aparelhos confiáveis e 2FA continuam)
+    auth.pinId = PIN_ID;
+    auth.sessions = [];
+  }
+  if (RESET_2FA) {
+    auth.totp = null;
+    auth.recovery = [];
+    auth.devices = [];
+    auth.sessions = [];
+    console.warn('RESET_2FA ativo: 2FA apagado. Configure de novo no app e REMOVA a variável RESET_2FA no Railway.');
+  }
   const now = Date.now();
-  return s.list.filter((x) => x.exp > now);
+  auth.sessions = auth.sessions.filter((x) => x.exp > now);
+  auth.devices = auth.devices.filter((x) => x.exp > now);
+  saveAuth();
 }
 
-function saveSessions() {
-  writeJson(SESSIONS_FILE, { pinId: PIN_ID, list: sessions });
+function saveAuth() {
+  writeSecure(AUTH_FILE, 'auth', auth);
 }
 
+// ------------------------------------------------------------------
+// TOTP (RFC 6238) — compatível com Senhas do iPhone, Google Authenticator, Authy etc.
+// ------------------------------------------------------------------
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(buf) {
+  let bits = 0, value = 0, out = '';
+  for (const byte of buf) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function base32Decode(str) {
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of str.replace(/=+$/, '').toUpperCase()) {
+    const i = B32.indexOf(ch);
+    if (i < 0) continue;
+    value = (value << 5) | i;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+
+function totpAt(secretB32, step) {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(step));
+  const h = crypto.createHmac('sha1', base32Decode(secretB32)).update(counter).digest();
+  const o = h[h.length - 1] & 15;
+  const n = ((h[o] & 127) << 24) | (h[o + 1] << 16) | (h[o + 2] << 8) | h[o + 3];
+  return String(n % 1e6).padStart(6, '0');
+}
+
+// Aceita o código atual e o de 30 s antes/depois. Retorna o "step" usado ou -1.
+function verifyTotp(secretB32, code, lastStep = -1) {
+  const now = Math.floor(Date.now() / 30000);
+  for (const w of [0, -1, 1]) {
+    const step = now + w;
+    if (step <= lastStep) continue; // impede reutilizar um código já usado
+    if (safeEqual(totpAt(secretB32, step), code)) return step;
+  }
+  return -1;
+}
+
+function newRecoveryCodes() {
+  const codes = [];
+  for (let i = 0; i < RECOVERY_CODES; i++) {
+    const s = base32Encode(crypto.randomBytes(5)); // 8 caracteres
+    codes.push(s.slice(0, 4) + '-' + s.slice(4, 8));
+  }
+  return codes;
+}
+
+const normRecovery = (c) => String(c).toUpperCase().replace(/[^A-Z2-7]/g, '');
+
+// ------------------------------------------------------------------
+// Sessões e aparelhos confiáveis (guardados só como hash)
+// ------------------------------------------------------------------
 function createSession(remember, req) {
   const token = crypto.randomBytes(32).toString('base64url');
   const now = Date.now();
   const ttl = remember ? REMEMBER_TTL : SHORT_TTL;
-  sessions = sessions.filter((x) => x.exp > now);
-  sessions.push({ h: sha256(token), remember, created: now, seen: now, exp: now + ttl, ua: String(req.headers['user-agent'] || '').slice(0, 120) });
-  if (sessions.length > MAX_SESSIONS) sessions = sessions.slice(-MAX_SESSIONS);
-  saveSessions();
+  auth.sessions = auth.sessions.filter((x) => x.exp > now);
+  auth.sessions.push({ h: sha256(token), remember, created: now, seen: now, exp: now + ttl, ua: String(req.headers['user-agent'] || '').slice(0, 120) });
+  if (auth.sessions.length > MAX_SESSIONS) auth.sessions = auth.sessions.slice(-MAX_SESSIONS);
   return { token, ttl };
 }
 
@@ -179,18 +326,16 @@ function findSession(req) {
   const token = parseCookies(req)[COOKIE];
   if (!token || token.length > 100) return null;
   const h = sha256(token);
-  const now = Date.now();
-  const s = sessions.find((x) => x.h === h);
+  const s = auth.sessions.find((x) => x.h === h);
   if (!s) return null;
-  if (s.exp <= now) {
-    sessions = sessions.filter((x) => x !== s);
-    saveSessions();
+  if (s.exp <= Date.now()) {
+    auth.sessions = auth.sessions.filter((x) => x !== s);
+    saveAuth();
     return null;
   }
   return { s, token };
 }
 
-// Sessões lembradas são renovadas com o uso (no máx. 1 gravação por dia)
 function touchSession(found, req, res) {
   const { s, token } = found;
   const now = Date.now();
@@ -200,13 +345,50 @@ function touchSession(found, req, res) {
     s.exp = now + REMEMBER_TTL;
     res.setHeader('Set-Cookie', sessionCookie(req, token, REMEMBER_TTL));
   }
-  saveSessions();
+  saveAuth();
+}
+
+function trustedDevice(req) {
+  const token = parseCookies(req)[DEVICE_COOKIE];
+  if (!token || token.length > 100) return null;
+  const h = sha256(token);
+  return auth.devices.find((x) => x.h === h && x.exp > Date.now()) || null;
+}
+
+function createDevice(req) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const now = Date.now();
+  auth.devices = auth.devices.filter((x) => x.exp > now);
+  auth.devices.push({ h: sha256(token), created: now, seen: now, exp: now + DEVICE_TTL, ua: String(req.headers['user-agent'] || '').slice(0, 120) });
+  if (auth.devices.length > MAX_DEVICES) auth.devices = auth.devices.slice(-MAX_DEVICES);
+  return token;
+}
+
+// Tickets: PIN correto aguardando o código 2FA (só em memória, 5 min)
+const tickets = new Map();
+
+function newTicket(data) {
+  const t = crypto.randomBytes(24).toString('base64url');
+  tickets.set(sha256(t), { ...data, exp: Date.now() + TICKET_TTL, tries: 0 });
+  return t;
+}
+
+function getTicket(t) {
+  if (typeof t !== 'string' || t.length > 100) return null;
+  const k = sha256(t);
+  const v = tickets.get(k);
+  if (!v) return null;
+  if (v.exp < Date.now() || v.tries >= TICKET_MAX_TRIES) {
+    tickets.delete(k);
+    return null;
+  }
+  return { k, v };
 }
 
 // ------------------------------------------------------------------
 // Bloqueio de tentativas
 // ------------------------------------------------------------------
-const ipFails = new Map(); // ip -> { fails, locks, until }
+const ipFails = new Map();
 let globalFails = [];
 let globalUntil = 0;
 
@@ -218,7 +400,7 @@ function lockStatus(ip) {
   return 0;
 }
 
-function registerFail(ip) {
+function registerFail(ip, what) {
   const now = Date.now();
   const r = ipFails.get(ip) || { fails: 0, locks: 0, until: 0 };
   r.fails++;
@@ -228,27 +410,29 @@ function registerFail(ip) {
     r.fails = 0;
   }
   ipFails.set(ip, r);
-
   globalFails = globalFails.filter((t) => now - t < GLOBAL_WINDOW);
   globalFails.push(now);
   if (globalFails.length >= GLOBAL_MAX_FAILS) {
     globalUntil = now + GLOBAL_LOCK;
     globalFails = [];
-    console.warn('ALERTA: muitas tentativas de PIN erradas. Login bloqueado por 30 min.');
+    console.warn('ALERTA: muitas tentativas erradas. Novos logins bloqueados por 30 min.');
   }
-  console.warn(`PIN errado vindo de ${ip}`);
+  console.warn(`${what} errado vindo de ${ip}`);
   return IP_MAX_FAILS - r.fails;
 }
 
-function registerSuccess(ip) {
-  ipFails.delete(ip);
+function failResponse(req, res, ip, what, extra = {}) {
+  const left = registerFail(ip, what);
+  const locked = lockStatus(ip);
+  if (locked) return json(req, res, 429, { error: 'locked', retryAfter: Math.ceil(locked / 1000) });
+  return json(req, res, 401, { error: what === 'PIN' ? 'pin' : 'code', attemptsLeft: left, ...extra });
 }
 
-// Limpa registros antigos de tempos em tempos
 setInterval(() => {
   const now = Date.now();
   for (const [ip, r] of ipFails) if (r.until < now - DAY) ipFails.delete(ip);
-}, 60 * 60 * 1000).unref();
+  for (const [k, v] of tickets) if (v.exp < now) tickets.delete(k);
+}, 10 * 60 * 1000).unref();
 
 // ------------------------------------------------------------------
 // API
@@ -271,37 +455,98 @@ function readBody(req, limit = MAX_BODY) {
   });
 }
 
+async function readJsonBody(req, limit) {
+  try {
+    const b = JSON.parse(await readBody(req, limit));
+    return b && typeof b === 'object' ? b : null;
+  } catch {
+    return null;
+  }
+}
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function finishLogin(req, res, remember, extra = {}, newDevice = false) {
+  const { token, ttl } = createSession(remember, req);
+  const cookies = [sessionCookie(req, token, remember ? ttl : null)];
+  if (newDevice) cookies.push(deviceCookie(req, createDevice(req)));
+  saveAuth();
+  return json(req, res, 200, { ok: true, ...extra }, { 'Set-Cookie': cookies });
+}
+
 async function handleApi(req, res, url) {
   const p = url.pathname;
   if (p === '/api/health') return json(req, res, 200, { ok: true });
-
-  if (!APP_PIN) return json(req, res, 503, { error: 'no_pin' });
-
+  if (fatal) return json(req, res, 503, { error: fatal });
   if (req.method !== 'GET' && !sameOrigin(req)) return json(req, res, 403, { error: 'origin' });
 
+  // Passo 1: PIN
   if (p === '/api/login' && req.method === 'POST') {
     const ip = clientIp(req);
     const wait = lockStatus(ip);
-    if (wait) return json(req, res, 429, { error: 'locked', retryAfter: Math.ceil(wait / 1000) }, { 'Retry-After': String(Math.ceil(wait / 1000)) });
-    let body;
-    try {
-      body = JSON.parse(await readBody(req, MAX_LOGIN_BODY));
-    } catch {
-      return json(req, res, 400, { error: 'invalid' });
-    }
-    // Pequeno atraso fixo: deixa tentativas automáticas mais lentas
-    await new Promise((r) => setTimeout(r, 400));
-    if (!body || typeof body.pin !== 'string' || !pinMatches(body.pin)) {
-      const left = registerFail(ip);
-      const locked = lockStatus(ip);
-      if (locked) return json(req, res, 429, { error: 'locked', retryAfter: Math.ceil(locked / 1000) });
-      return json(req, res, 401, { error: 'pin', attemptsLeft: left });
-    }
-    registerSuccess(ip);
+    if (wait) return json(req, res, 429, { error: 'locked', retryAfter: Math.ceil(wait / 1000) });
+    const body = await readJsonBody(req, MAX_LOGIN_BODY);
+    if (!body) return json(req, res, 400, { error: 'invalid' });
+    await delay(400);
+    if (typeof body.pin !== 'string' || !pinMatches(body.pin)) return failResponse(req, res, ip, 'PIN');
     const remember = body.remember === true;
-    const { token, ttl } = createSession(remember, req);
-    // Sem "lembrar": cookie de sessão (some ao fechar o app); o servidor ainda expira em 12 h
-    return json(req, res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(req, token, remember ? ttl : null) });
+
+    // Aparelho já confirmado com 2FA: só o PIN basta
+    const dev = auth.totp && trustedDevice(req);
+    if (dev) {
+      dev.seen = Date.now();
+      dev.exp = Date.now() + DEVICE_TTL;
+      return finishLogin(req, res, remember);
+    }
+    if (!auth.totp) {
+      const secret = base32Encode(crypto.randomBytes(20));
+      const ticket = newTicket({ remember, setupSecret: secret });
+      const uri = `otpauth://totp/Rotina:Rotina%20App?secret=${secret}&issuer=Rotina&algorithm=SHA1&digits=6&period=30`;
+      return json(req, res, 200, { step: 'setup', ticket, secret, uri });
+    }
+    return json(req, res, 200, { step: 'code', ticket: newTicket({ remember }) });
+  }
+
+  // Passo 2: código do autenticador (ou código de recuperação)
+  if (p === '/api/login/verify' && req.method === 'POST') {
+    const ip = clientIp(req);
+    const wait = lockStatus(ip);
+    if (wait) return json(req, res, 429, { error: 'locked', retryAfter: Math.ceil(wait / 1000) });
+    const body = await readJsonBody(req, MAX_LOGIN_BODY);
+    if (!body) return json(req, res, 400, { error: 'invalid' });
+    const t = getTicket(body.ticket);
+    if (!t) return json(req, res, 401, { error: 'ticket' });
+    await delay(400);
+    const code = String(body.code || '').replace(/\s/g, '');
+
+    if (t.v.setupSecret) {
+      if (auth.totp) { tickets.delete(t.k); return json(req, res, 409, { error: 'already_setup' }); }
+      const step = /^\d{6}$/.test(code) ? verifyTotp(t.v.setupSecret, code) : -1;
+      if (step < 0) { t.v.tries++; return failResponse(req, res, ip, 'Código 2FA'); }
+      tickets.delete(t.k);
+      const codes = newRecoveryCodes();
+      auth.totp = { secret: t.v.setupSecret, lastStep: step, created: Date.now() };
+      auth.recovery = codes.map((c) => sha256(normRecovery(c)));
+      console.log('2FA configurado.');
+      return finishLogin(req, res, t.v.remember, { recoveryCodes: codes }, true);
+    }
+
+    if (!auth.totp) { tickets.delete(t.k); return json(req, res, 401, { error: 'ticket' }); }
+    let ok = false, usedRecovery = false;
+    if (/^\d{6}$/.test(code)) {
+      const step = verifyTotp(auth.totp.secret, code, auth.totp.lastStep);
+      if (step >= 0) { auth.totp.lastStep = step; ok = true; }
+    } else {
+      const h = sha256(normRecovery(code));
+      const i = auth.recovery.indexOf(h);
+      if (i >= 0 && normRecovery(code).length === 8) {
+        auth.recovery.splice(i, 1); // cada código de recuperação vale uma vez
+        ok = usedRecovery = true;
+      }
+    }
+    if (!ok) { t.v.tries++; return failResponse(req, res, ip, 'Código 2FA'); }
+    tickets.delete(t.k);
+    return finishLogin(req, res, t.v.remember, usedRecovery ? { recoveryLeft: auth.recovery.length } : {}, true);
   }
 
   const found = findSession(req);
@@ -313,40 +558,37 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/logout' && req.method === 'POST') {
     if (found) {
-      sessions = sessions.filter((x) => x !== found.s);
-      saveSessions();
+      auth.sessions = auth.sessions.filter((x) => x !== found.s);
+      saveAuth();
     }
-    return json(req, res, 200, { ok: true }, { 'Set-Cookie': clearCookie(req) });
+    return json(req, res, 200, { ok: true }, { 'Set-Cookie': clearSessionCookie(req) });
   }
 
-  if (!found) return json(req, res, 401, { error: 'auth' }, { 'Set-Cookie': clearCookie(req) });
+  if (!found) return json(req, res, 401, { error: 'auth' }, { 'Set-Cookie': clearSessionCookie(req) });
   touchSession(found, req, res);
 
   if (p === '/api/logout-all' && req.method === 'POST') {
-    sessions = [];
-    saveSessions();
-    return json(req, res, 200, { ok: true }, { 'Set-Cookie': clearCookie(req) });
+    auth.sessions = [];
+    auth.devices = [];
+    saveAuth();
+    return json(req, res, 200, { ok: true }, { 'Set-Cookie': [clearSessionCookie(req), clearDeviceCookie(req)] });
   }
 
-  if (p === '/api/sessions' && req.method === 'GET') {
-    return json(req, res, 200, { count: sessions.length });
+  if (p === '/api/security' && req.method === 'GET') {
+    return json(req, res, 200, { sessions: auth.sessions.length, devices: auth.devices.length, recoveryLeft: auth.recovery.length });
   }
 
   if (p === '/api/state' && req.method === 'GET') {
-    return json(req, res, 200, { state: readJson(STATE_FILE) });
+    return json(req, res, 200, { state: readSecure(STATE_FILE, 'state').value });
   }
 
   if (p === '/api/state' && req.method === 'PUT') {
-    try {
-      const body = JSON.parse(await readBody(req));
-      if (!body || typeof body.state !== 'object' || body.state === null || Array.isArray(body.state)) {
-        return json(req, res, 400, { error: 'invalid' });
-      }
-      writeJson(STATE_FILE, body.state);
-      return json(req, res, 200, { ok: true, updatedAt: body.state.updatedAt || null });
-    } catch (e) {
-      return json(req, res, e.message === 'too_large' ? 413 : 400, { error: 'invalid' });
+    const body = await readJsonBody(req, MAX_BODY).catch(() => null);
+    if (!body || typeof body.state !== 'object' || body.state === null || Array.isArray(body.state)) {
+      return json(req, res, 400, { error: 'invalid' });
     }
+    writeSecure(STATE_FILE, 'state', body.state);
+    return json(req, res, 200, { ok: true, updatedAt: body.state.updatedAt || null });
   }
 
   return json(req, res, 404, { error: 'not_found' });
@@ -379,6 +621,8 @@ function serveStatic(req, res, url) {
   });
 }
 
+init();
+
 const server = http.createServer((req, res) => {
   let url;
   try {
@@ -387,15 +631,21 @@ const server = http.createServer((req, res) => {
     return send(req, res, 400, 'Bad request');
   }
   if (url.pathname.startsWith('/api/')) {
-    handleApi(req, res, url).catch(() => json(req, res, 500, { error: 'server' }));
+    handleApi(req, res, url).catch((e) => {
+      console.error('Erro na API:', e.message);
+      json(req, res, 500, { error: 'server' });
+    });
   } else {
     serveStatic(req, res, url);
   }
 });
+server.headersTimeout = 20000;
+server.requestTimeout = 30000;
 
 server.listen(PORT, () => {
   console.log(`Rotina PMSC rodando na porta ${PORT}`);
-  console.log(`Dados em: ${STATE_FILE}`);
-  if (!APP_PIN) console.log('ATENÇÃO: APP_PIN não definido — a API fica bloqueada até você criar a variável APP_PIN.');
-  else if (APP_PIN.length < 6) console.log('AVISO: use um APP_PIN com pelo menos 6 dígitos.');
+  if (fatal === 'no_pin') console.log('ATENÇÃO: APP_PIN não definido — a API fica bloqueada.');
+  if (fatal === 'no_key') console.log('ATENÇÃO: DATA_KEY ausente ou com menos de 32 caracteres — a API fica bloqueada.');
+  if (APP_PIN && APP_PIN.length < 6) console.log('AVISO: use um APP_PIN com pelo menos 6 dígitos.');
+  if (!fatal) console.log(`Dados criptografados em: ${DATA_DIR} · 2FA ${auth.totp ? 'ativo' : 'aguardando configuração'}`);
 });

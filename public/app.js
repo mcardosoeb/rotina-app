@@ -204,23 +204,135 @@ function emptyState() {
   return { version: 1, updatedAt: 0, settings: { ...DEFAULTS }, days: {}, weights: [] };
 }
 
-let state = loadLocal();
+let state = emptyState();
 let current = todayKey();
 let tab = 'hoje';
 let dirty = false;
 let syncTimer = null;
 let online = false;
 
-function loadLocal() {
-  try {
-    const s = JSON.parse(localStorage.getItem(LS_STATE));
-    if (s && s.days) { s.settings = { ...DEFAULTS, ...s.settings }; return s; }
-  } catch { /* ignora */ }
-  return emptyState();
+// Garante tipos corretos em dados vindos do servidor, do aparelho ou de um backup
+// (impede que um backup adulterado injete HTML/script na tela)
+function sanitizeState(s) {
+  if (!s || typeof s !== 'object' || !s.days || typeof s.days !== 'object') return null;
+  const num = (v, d) => (v !== '' && v !== null && Number.isFinite(Number(v)) ? Number(v) : d);
+  const isDate = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  const st = s.settings && typeof s.settings === 'object' ? s.settings : {};
+  const out = {
+    version: 1,
+    updatedAt: num(s.updatedAt, 0),
+    settings: {
+      kcalTarget: num(st.kcalTarget, DEFAULTS.kcalTarget),
+      waterTarget: num(st.waterTarget, DEFAULTS.waterTarget),
+      coffeeMax: num(st.coffeeMax, DEFAULTS.coffeeMax),
+      prova: isDate(st.prova) ? st.prova : DEFAULTS.prova,
+      provaNome: typeof st.provaNome === 'string' ? st.provaNome.slice(0, 40) : DEFAULTS.provaNome,
+    },
+    days: {},
+    weights: Array.isArray(s.weights)
+      ? s.weights.filter((w) => w && isDate(w.date) && Number.isFinite(Number(w.kg))).map((w) => ({ date: w.date, kg: Number(w.kg) }))
+      : [],
+  };
+  const types = DAY_TYPES.map(([id]) => id);
+  for (const [k, d] of Object.entries(s.days)) {
+    if (!isDate(k) || !d || typeof d !== 'object') continue;
+    const checks = {};
+    if (d.checks && typeof d.checks === 'object') {
+      for (const [id, v] of Object.entries(d.checks)) if (/^[\w-]{1,30}$/.test(id)) checks[id] = !!v;
+    }
+    const day = {
+      type: types.includes(d.type) ? d.type : autoType(k),
+      checks,
+      water: num(d.water, 0),
+      coffee: num(d.coffee, 0),
+      q: num(d.q, ''),
+      a: num(d.a, ''),
+    };
+    if (d.coffeeLate) day.coffeeLate = true;
+    if (typeof d.wake === 'string' && /^\d{2}:\d{2}$/.test(d.wake)) day.wake = d.wake;
+    if (Number.isInteger(d.dieta) && d.dieta >= 0 && d.dieta <= 10) day.dieta = d.dieta;
+    if (Number.isInteger(d.nota) && d.nota >= 0 && d.nota <= 10) day.nota = d.nota;
+    if (typeof d.obs === 'string') day.obs = d.obs.slice(0, 1000);
+    out.days[k] = day;
+  }
+  return out;
 }
 
+// ------------------------------------------------------------------
+// Cópia local criptografada (AES-GCM). A chave fica no IndexedDB do
+// aparelho como não-exportável: nem o próprio app consegue lê-la em texto.
+// ------------------------------------------------------------------
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+
+function idb(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('rotina-sec', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('keys');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('keys', mode);
+      const req = fn(tx.objectStore('keys'));
+      tx.oncomplete = () => { db.close(); resolve(req && req.result); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  });
+}
+
+let localKeyPromise = null;
+function getLocalKey() {
+  if (!localKeyPromise) {
+    localKeyPromise = (async () => {
+      let key = await idb('readonly', (st) => st.get('aes'));
+      if (!key) {
+        key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+        await idb('readwrite', (st) => st.put(key, 'aes'));
+      }
+      return key;
+    })().catch((e) => { localKeyPromise = null; throw e; });
+  }
+  return localKeyPromise;
+}
+
+async function loadLocal() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LS_STATE));
+    if (!raw) return emptyState();
+    if (raw.enc) {
+      const key = await getLocalKey();
+      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(raw.iv) }, key, unb64(raw.data));
+      return sanitizeState(JSON.parse(new TextDecoder().decode(plain))) || emptyState();
+    }
+    // Cópia antiga, sem criptografia: carrega e regrava criptografada
+    state = sanitizeState(raw) || emptyState();
+    await saveLocal();
+    return state;
+  } catch {
+    return emptyState();
+  }
+}
+
+let localChain = Promise.resolve();
 function saveLocal() {
-  try { localStorage.setItem(LS_STATE, JSON.stringify(state)); } catch { /* cheio */ }
+  const snapshot = JSON.stringify(state);
+  localChain = localChain.then(async () => {
+    const key = await getLocalKey();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(snapshot));
+    localStorage.setItem(LS_STATE, JSON.stringify({ enc: 1, iv: b64(iv), data: b64(data) }));
+  }).catch(() => {
+    // Sem IndexedDB/WebCrypto: não guarda cópia local em texto puro (os dados ficam só no servidor)
+    localStorage.removeItem(LS_STATE);
+  });
+  return localChain;
+}
+
+async function wipeLocal() {
+  await localChain;
+  localStorage.removeItem(LS_STATE);
+  localKeyPromise = null;
+  try { await idb('readwrite', (st) => st.delete('aes')); } catch { /* sem IndexedDB */ }
 }
 
 function getDay(k) {
@@ -267,8 +379,7 @@ async function pull() {
     if (!server || (state.updatedAt || 0) > (server.updatedAt || 0)) {
       await push();
     } else if ((server.updatedAt || 0) > (state.updatedAt || 0)) {
-      state = server;
-      state.settings = { ...DEFAULTS, ...state.settings };
+      state = sanitizeState(server) || state;
       saveLocal();
       setSync('ok');
     } else {
@@ -291,24 +402,105 @@ function setSync(s) {
 // ------------------------------------------------------------------
 // PIN
 // ------------------------------------------------------------------
+// Telas: 'pin' → ('setup' | 'code') → ('recovery' na primeira configuração)
+const $auth = () => document.getElementById('authCard');
+let authTicket = null;
+let authBusy = false;
+
 function showPin(msg) {
+  authTicket = null;
   document.body.classList.add('locked');
   document.getElementById('pinModal').classList.remove('hidden');
-  document.getElementById('pinError').textContent = msg || '';
-  document.getElementById('pinInput').value = '';
-  setTimeout(() => document.getElementById('pinInput').focus(), 50);
+  $auth().innerHTML = `
+    <h2>Digite seu PIN</h2>
+    <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN">
+    <label class="remember"><input type="checkbox" id="pinRemember" checked> Lembrar neste aparelho</label>
+    <p class="small auth-msg" id="authMsg">${esc(msg || '')}</p>
+    <button class="btn primary block" id="authGo">Entrar</button>`;
+  bindAuth('pinInput', loginPin);
+}
+
+function showCode(msg) {
+  $auth().innerHTML = `
+    <h2>Verificação em duas etapas</h2>
+    <p class="small muted">Primeiro acesso neste aparelho. Digite o código de 6 dígitos do seu app autenticador.</p>
+    <input id="codeInput" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="9" placeholder="000000">
+    <p class="small auth-msg" id="authMsg">${esc(msg || '')}</p>
+    <button class="btn primary block" id="authGo">Confirmar</button>
+    <p class="small muted" style="margin:10px 0 0">Perdeu o autenticador? Digite um dos códigos de recuperação (ex.: ABCD-EFGH).</p>
+    <button class="btn block small" id="authBack" style="margin-top:8px">‹ Voltar</button>`;
+  bindAuth('codeInput', verifyCode);
+}
+
+function showSetup(data, msg) {
+  $auth().innerHTML = `
+    <h2>Ative a verificação em duas etapas</h2>
+    <ol class="small setup-steps">
+      <li>Toque em <b>Adicionar ao autenticador</b> para criar a conta "Rotina"
+        (no iPhone abre em Ajustes › Senhas; também funciona com Google Authenticator ou Authy).</li>
+      <li>Se o botão não abrir nada, copie a chave e cole no autenticador:
+        <code class="secret" id="secretTxt">${esc(data.secret.replace(/(.{4})/g, '$1 ').trim())}</code>
+        <button class="btn small" id="copySecret">Copiar chave</button></li>
+      <li>Digite o código de 6 dígitos que aparecer.</li>
+    </ol>
+    <a class="btn block" href="${esc(data.uri)}">Adicionar ao autenticador</a>
+    <div style="height:10px"></div>
+    <input id="codeInput" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000">
+    <p class="small auth-msg" id="authMsg">${esc(msg || '')}</p>
+    <button class="btn primary block" id="authGo">Ativar</button>
+    <button class="btn block small" id="authBack" style="margin-top:8px">‹ Voltar</button>`;
+  document.getElementById('copySecret').onclick = () => copyText(data.secret, 'Chave copiada');
+  bindAuth('codeInput', verifyCode);
+}
+
+function showRecovery(codes) {
+  $auth().innerHTML = `
+    <h2>Guarde seus códigos de recuperação</h2>
+    <p class="small muted">Se perder o celular ou o autenticador, cada código abaixo permite entrar <b>uma vez</b>.
+      Guarde num lugar seguro (gerenciador de senhas ou papel). Eles não serão mostrados de novo.</p>
+    <pre class="checkin recovery">${codes.map(esc).join('\n')}</pre>
+    <button class="btn block" id="copyCodes">Copiar códigos</button>
+    <div style="height:8px"></div>
+    <button class="btn primary block" id="authDone">Já guardei</button>`;
+  document.getElementById('copyCodes').onclick = () => copyText(codes.join('\n'), 'Códigos copiados');
+  document.getElementById('authDone').onclick = () => { if (confirm('Confirma que guardou os códigos?')) afterLogin(); };
+}
+
+function bindAuth(inputId, action) {
+  const input = document.getElementById(inputId);
+  setTimeout(() => input.focus(), 50);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') action(); });
+  document.getElementById('authGo').onclick = action;
+  const back = document.getElementById('authBack');
+  if (back) back.onclick = () => showPin();
+}
+
+function authMsg(msg) {
+  const el = document.getElementById('authMsg');
+  if (el) el.textContent = msg;
 }
 
 function hidePin() {
   document.body.classList.remove('locked');
   document.getElementById('pinModal').classList.add('hidden');
+  $auth().innerHTML = '';
 }
+
+async function copyText(txt, ok) {
+  try { await navigator.clipboard.writeText(txt); toast(ok); } catch { toast('Não foi possível copiar'); }
+}
+
+const FATAL_MSG = {
+  no_pin: 'Servidor sem PIN configurado (variável APP_PIN).',
+  no_key: 'Servidor sem chave de criptografia (variável DATA_KEY).',
+  bad_key: 'A DATA_KEY do servidor não abre os dados salvos. Restaure a chave correta no Railway.',
+};
 
 async function checkAuth() {
   try {
     const r = await fetch('/api/auth', { credentials: 'same-origin' });
     const a = await r.json();
-    if (r.status === 503) { showPin('Servidor sem PIN configurado (variável APP_PIN).'); return false; }
+    if (r.status === 503) { showPin(FATAL_MSG[a.error] || 'Servidor indisponível.'); return false; }
     if (!a.ok) { showPin(); return false; }
     return true;
   } catch {
@@ -320,45 +512,74 @@ function fmtWait(sec) {
   return sec >= 3600 ? `${Math.ceil(sec / 3600)} h` : sec >= 60 ? `${Math.ceil(sec / 60)} min` : `${sec} s`;
 }
 
-let loggingIn = false;
-document.getElementById('pinOk').onclick = async () => {
-  if (loggingIn) return;
-  const pin = document.getElementById('pinInput').value.trim();
-  const remember = document.getElementById('pinRemember').checked;
-  if (!pin) return;
-  loggingIn = true;
-  document.getElementById('pinOk').disabled = true;
-  try {
-    const r = await fetch('/api/login', {
-      method: 'POST', headers: headers(), credentials: 'same-origin', body: JSON.stringify({ pin, remember }),
-    });
-    const a = await r.json().catch(() => ({}));
-    if (r.ok) {
-      hidePin();
-      await pull();
-      render();
-    } else if (r.status === 429) {
-      showPin(`Muitas tentativas erradas. Tente de novo em ${fmtWait(a.retryAfter || 900)}.`);
-    } else if (r.status === 401) {
-      showPin(a.attemptsLeft > 0 ? `PIN incorreto. ${a.attemptsLeft} tentativa(s) antes do bloqueio.` : 'PIN incorreto.');
-    } else if (r.status === 503) {
-      showPin('Servidor sem PIN configurado (variável APP_PIN).');
-    } else {
-      showPin('Erro ao entrar. Tente de novo.');
-    }
-  } catch {
-    showPin('Sem internet. Conecte-se para entrar.');
-  } finally {
-    loggingIn = false;
-    document.getElementById('pinOk').disabled = false;
+async function authPost(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: headers(), credentials: 'same-origin', body: JSON.stringify(body) });
+  return { r, a: await r.json().catch(() => ({})) };
+}
+
+function authError(r, a, what) {
+  if (r.status === 429) return `Muitas tentativas erradas. Tente de novo em ${fmtWait(a.retryAfter || 900)}.`;
+  if (r.status === 503) return FATAL_MSG[a.error] || 'Servidor indisponível.';
+  if (r.status === 401 && (a.error === 'pin' || a.error === 'code')) {
+    return `${what} incorreto.` + (a.attemptsLeft > 0 ? ` ${a.attemptsLeft} tentativa(s) antes do bloqueio.` : '');
   }
-};
-document.getElementById('pinInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') document.getElementById('pinOk').click(); });
+  return 'Erro ao entrar. Tente de novo.';
+}
+
+async function withBusy(fn) {
+  if (authBusy) return;
+  authBusy = true;
+  const go = document.getElementById('authGo');
+  if (go) go.disabled = true;
+  try { await fn(); } catch { authMsg('Sem internet. Conecte-se para entrar.'); }
+  finally {
+    authBusy = false;
+    const g = document.getElementById('authGo');
+    if (g) g.disabled = false;
+  }
+}
+
+function loginPin() {
+  return withBusy(async () => {
+    const pin = document.getElementById('pinInput').value.trim();
+    const remember = document.getElementById('pinRemember').checked;
+    if (!pin) return;
+    const { r, a } = await authPost('/api/login', { pin, remember });
+    if (r.ok && a.ok) return afterLogin();
+    if (r.ok && a.step === 'code') { authTicket = a.ticket; return showCode(); }
+    if (r.ok && a.step === 'setup') { authTicket = a.ticket; return showSetup(a); }
+    authMsg(authError(r, a, 'PIN'));
+    document.getElementById('pinInput').value = '';
+  });
+}
+
+function verifyCode() {
+  return withBusy(async () => {
+    const code = document.getElementById('codeInput').value.trim();
+    if (!code) return;
+    const { r, a } = await authPost('/api/login/verify', { ticket: authTicket, code });
+    if (r.ok && a.ok) {
+      if (a.recoveryCodes) return showRecovery(a.recoveryCodes);
+      if (a.recoveryLeft != null) toast(`Código de recuperação usado. Restam ${a.recoveryLeft}.`);
+      return afterLogin();
+    }
+    if (a.error === 'ticket') return showPin('Tempo esgotado. Digite o PIN de novo.');
+    if (r.status === 429) return showPin(authError(r, a));
+    authMsg(authError(r, a, 'Código'));
+    document.getElementById('codeInput').value = '';
+  });
+}
+
+async function afterLogin() {
+  hidePin();
+  await pull();
+  render();
+}
 
 // Sair: envia o que falta, encerra a sessão e apaga a cópia dos dados deste aparelho
 async function logout(all) {
   const msg = all
-    ? 'Sair de TODOS os aparelhos? Todos vão pedir o PIN de novo. Os dados deste aparelho serão apagados (continuam no servidor).'
+    ? 'Sair de TODOS os aparelhos? Todos vão pedir PIN e código do autenticador de novo. Os dados deste aparelho serão apagados (continuam no servidor).'
     : 'Sair deste aparelho? Os dados daqui serão apagados (continuam no servidor) e o PIN será pedido de novo.';
   if (!confirm(msg)) return;
   if (dirty) await push();
@@ -366,7 +587,7 @@ async function logout(all) {
   try {
     await fetch(all ? '/api/logout-all' : '/api/logout', { method: 'POST', headers: headers(), credentials: 'same-origin' });
   } catch { /* offline: o cookie expira sozinho */ }
-  localStorage.removeItem(LS_STATE);
+  await wipeLocal();
   state = emptyState();
   dirty = false;
   setTab('hoje');
@@ -638,7 +859,7 @@ function renderPeso() {
     </div>
 
     <div class="card"><h3>Histórico</h3>
-      ${ws.slice().reverse().map((w) => `<div class="list-row"><span>${fmtShort(w.date)}</span><span class="row"><b>${fmtNum(w.kg, 1)} kg</b><button class="btn small danger" data-del-w="${w.date}">✕</button></span></div>`).join('') || '<div class="muted small">Nenhuma pesagem ainda. Comece com o peso de hoje.</div>'}
+      ${ws.slice().reverse().map((w) => `<div class="list-row"><span>${fmtShort(w.date)}</span><span class="row"><b>${fmtNum(w.kg, 1)} kg</b><button class="btn small danger" data-del-w="${esc(w.date)}">✕</button></span></div>`).join('') || '<div class="muted small">Nenhuma pesagem ainda. Comece com o peso de hoje.</div>'}
     </div>
   `;
 
@@ -781,15 +1002,15 @@ function renderAjustes() {
   $view.innerHTML = `
     <div class="card"><h3>Metas</h3>
       <div class="grid2">
-        <div class="field"><label>Calorias/dia (aprox.)</label><input type="number" id="sK" value="${s.kcalTarget}"></div>
-        <div class="field"><label>Água/dia (ml)</label><input type="number" id="sW" value="${s.waterTarget}"></div>
-        <div class="field"><label>Café máx. (ml)</label><input type="number" id="sC" value="${s.coffeeMax}"></div>
+        <div class="field"><label>Calorias/dia (aprox.)</label><input type="number" id="sK" value="${esc(s.kcalTarget)}"></div>
+        <div class="field"><label>Água/dia (ml)</label><input type="number" id="sW" value="${esc(s.waterTarget)}"></div>
+        <div class="field"><label>Café máx. (ml)</label><input type="number" id="sC" value="${esc(s.coffeeMax)}"></div>
       </div>
     </div>
     <div class="card"><h3>Próxima prova</h3>
       <div class="grid2">
         <div class="field"><label>Nome</label><input type="text" id="sN" value="${esc(s.provaNome)}"></div>
-        <div class="field"><label>Data</label><input type="date" id="sD" value="${s.prova}"></div>
+        <div class="field"><label>Data</label><input type="date" id="sD" value="${esc(s.prova)}"></div>
       </div>
     </div>
     <button class="btn primary block" id="sSave">Salvar ajustes</button>
@@ -799,13 +1020,15 @@ function renderAjustes() {
         <button class="btn" id="sExport">Exportar dados</button>
         <label class="btn" style="text-align:center">Importar<input type="file" id="sImport" accept="application/json" class="hidden"></label>
       </div>
-      <div class="small muted" style="margin-top:8px">Status: ${online ? 'sincronizado com o servidor' : 'offline — dados salvos no celular'}.</div>
+      <div class="small muted" style="margin-top:8px">O arquivo exportado <b>não</b> é criptografado: guarde em local seguro e apague depois de usar.</div>
+      <div class="small muted" style="margin-top:4px">Status: ${online ? 'sincronizado com o servidor' : 'offline — dados salvos no celular'}.</div>
     </div>
     <div class="card"><h3>Sessão</h3>
       <button class="btn danger block" id="sLogout">Sair deste aparelho</button>
       <div style="height:8px"></div>
       <button class="btn danger block" id="sLogoutAll">Sair de todos os aparelhos</button>
-      <div class="small muted" style="margin-top:8px">Use "todos os aparelhos" se perdeu o celular ou acha que alguém viu seu PIN. Depois troque o APP_PIN no Railway.</div>
+      <div class="small muted" style="margin-top:8px">Use "todos os aparelhos" se perdeu o celular ou acha que alguém viu seu PIN: todos voltam a pedir o código do autenticador. Depois troque o APP_PIN no Railway.</div>
+      <div class="small muted" style="margin-top:4px" id="secInfo"></div>
     </div>
     <button class="btn block" id="sBack">‹ Voltar</button>
   `;
@@ -828,13 +1051,17 @@ function renderAjustes() {
     const f = e.target.files[0];
     if (!f) return;
     try {
-      const s2 = JSON.parse(await f.text());
-      if (!s2.days) throw new Error();
+      const s2 = sanitizeState(JSON.parse(await f.text()));
+      if (!s2) throw new Error();
       if (!confirm('Substituir todos os dados atuais pelo backup?')) return;
-      state = s2; state.settings = { ...DEFAULTS, ...state.settings };
+      state = s2;
       save(); toast('Backup importado'); setTab('hoje');
     } catch { toast('Arquivo inválido'); }
   };
+  fetch('/api/security', { credentials: 'same-origin' }).then((r) => r.ok && r.json()).then((x) => {
+    const el = document.getElementById('secInfo');
+    if (x && el) el.textContent = `Sessões ativas: ${x.sessions} · aparelhos confiáveis: ${x.devices} · códigos de recuperação restantes: ${x.recoveryLeft}`;
+  }).catch(() => {});
   document.getElementById('sLogout').onclick = () => logout(false);
   document.getElementById('sLogoutAll').onclick = () => logout(true);
   document.getElementById('sBack').onclick = () => setTab('hoje');
@@ -883,6 +1110,7 @@ window.addEventListener('online', () => { if (dirty) push(); });
 (async function init() {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   setSync(dirty ? 'pending' : 'err');
+  state = await loadLocal();
   render();
   if (await checkAuth()) { await pull(); render(); }
 })();
