@@ -6,7 +6,6 @@
 // ------------------------------------------------------------------
 const DEFAULTS = {
   kcalTarget: 3000,
-  protTarget: 170,
   waterTarget: 3000,
   coffeeMax: 500,
   prova: '2026-12-13',
@@ -34,14 +33,14 @@ const TREINO = {
 };
 
 const MEALS = {
-  ritual: { title: 'Ritual: limão, gengibre e própolis', sub: '+ 1 copo de água · café preto 150 ml', kcal: 10, prot: 0 },
-  cafe: { title: 'Café da manhã', sub: '3 ovos + 1 pão + 1 banana + café com leite', kcal: 560, prot: 28 },
-  lanche: { title: 'Lanche', sub: 'Pão com pasta de amendoim + banana', kcal: 330, prot: 12 },
-  almoco: { title: 'Almoço (refeitório)', sub: '5–6 col. arroz + feijão + carne/frango (palma da mão) + salada', kcal: 780, prot: 50 },
-  pre: { title: 'Pré-treino', sub: '2 pães + 2 ovos (ou banana + aveia + mel)', kcal: 400, prot: 20 },
-  whey: { title: 'Whey + creatina', sub: '1 dose de whey · 3–5 g de creatina', kcal: 120, prot: 24 },
-  jantar: { title: 'Jantar', sub: 'Arroz + feijão + carne moída ou 3 ovos + legumes', kcal: 550, prot: 40 },
-  ceia: { title: 'Ceia', sub: '250 ml de leite + 2 colheres de aveia', kcal: 225, prot: 11 },
+  ritual: { title: 'Ritual: limão, gengibre e própolis', sub: '+ 1 copo de água · café preto 150 ml', kcal: 10 },
+  cafe: { title: 'Café da manhã', sub: '3 ovos + 1 pão + 1 banana + café com leite', kcal: 560 },
+  lanche: { title: 'Lanche', sub: 'Pão com pasta de amendoim + banana', kcal: 330 },
+  almoco: { title: 'Almoço (refeitório)', sub: '5–6 col. arroz + feijão + carne/frango (palma da mão) + salada', kcal: 780 },
+  pre: { title: 'Pré-treino', sub: '2 pães + 2 ovos (ou banana + aveia + mel)', kcal: 400 },
+  whey: { title: 'Whey + creatina', sub: '1 dose de whey · 3–5 g de creatina', kcal: 120 },
+  jantar: { title: 'Jantar', sub: 'Arroz + feijão + carne moída ou 3 ovos + legumes', kcal: 550 },
+  ceia: { title: 'Ceia', sub: '250 ml de leite + 2 colheres de aveia', kcal: 225 },
 };
 
 const DAY_TYPES = [
@@ -59,7 +58,7 @@ const CAT_COLOR = {
 
 function meal(id, t) {
   const m = MEALS[id];
-  return { id, t, title: m.title, sub: m.sub, cat: 'refeicao', kcal: m.kcal, prot: m.prot };
+  return { id, t, title: m.title, sub: m.sub, cat: 'refeicao', kcal: m.kcal };
 }
 
 function buildItems(day, key) {
@@ -225,7 +224,7 @@ function saveLocal() {
 
 function getDay(k) {
   if (!state.days[k]) {
-    state.days[k] = { type: autoType(k), checks: {}, kcal: {}, extras: [], water: 0, coffee: 0, q: '', a: '' };
+    state.days[k] = { type: autoType(k), checks: {}, water: 0, coffee: 0, q: '', a: '' };
   }
   return state.days[k];
 }
@@ -327,21 +326,21 @@ function dayStats(k) {
   const items = buildItems(day, k);
   const checkable = items.filter((i) => !i.info && !i.optional);
   const done = checkable.filter((i) => day.checks[i.id]).length;
-  let kcal = 0, prot = 0, studyDone = 0, studyPlan = 0, leitura = 0, mealsDone = 0;
+  // Calorias são só uma referência aproximada do plano (sem contagem exata)
+  let kcal = 0, kcalPlan = 0, studyDone = 0, studyPlan = 0, leitura = 0, mealsDone = 0, mealsTotal = 0;
   for (const i of items) {
-    if (i.cat === 'refeicao' && day.checks[i.id]) {
-      kcal += day.kcal[i.id] != null ? day.kcal[i.id] : i.kcal;
-      prot += i.prot || 0;
-      mealsDone++;
+    if (i.cat === 'refeicao') {
+      mealsTotal++;
+      kcalPlan += i.kcal;
+      if (day.checks[i.id]) { kcal += i.kcal; mealsDone++; }
     }
     if (i.cat === 'estudo') { studyPlan += i.min; if (day.checks[i.id]) studyDone += i.min; }
     if (i.cat === 'leitura' && day.checks[i.id]) leitura += i.min;
   }
-  for (const e of day.extras || []) { kcal += Number(e.kcal) || 0; prot += Number(e.prot) || 0; }
   const treinoItem = items.find((i) => i.id === 'treino');
   return {
     items, total: checkable.length, done, pct: checkable.length ? Math.round((done / checkable.length) * 100) : 0,
-    kcal, prot, studyDone, studyPlan, leitura, mealsDone,
+    kcal, kcalPlan, studyDone, studyPlan, leitura, mealsDone, mealsTotal,
     treino: treinoItem ? !!day.checks.treino : null,
     q: Number(day.q) || 0, a: Number(day.a) || 0,
   };
@@ -410,7 +409,7 @@ function renderHoje() {
   const items = st.items.map((i) => {
     const on = !!day.checks[i.id];
     const color = CAT_COLOR[i.cat];
-    const kcalTxt = i.cat === 'refeicao' ? ` · ${day.kcal[i.id] != null ? day.kcal[i.id] : i.kcal} kcal` : '';
+    const kcalTxt = i.cat === 'refeicao' ? ` · ≈ ${fmtNum(i.kcal)} kcal` : '';
     if (i.info) {
       return `<div class="item info"><div class="time">${i.t}</div><div class="body"><div class="title">${esc(i.title)}</div></div></div>`;
     }
@@ -422,7 +421,6 @@ function renderHoje() {
     </div>`;
   }).join('');
 
-  const kpct = Math.round((st.kcal / s.kcalTarget) * 100);
   const acerto = st.q ? Math.round((st.a / st.q) * 100) : null;
 
   $view.innerHTML = `
@@ -430,10 +428,10 @@ function renderHoje() {
       ${ring(st.pct)}
       <div style="flex:1">
         <div class="big" style="font-size:22px">${st.done} de ${st.total} feitos</div>
-        <div class="small muted" style="margin:4px 0 8px">Estudo ${st.studyDone}/${st.studyPlan} min · ${fmtNum(st.kcal)}/${fmtNum(s.kcalTarget)} kcal</div>
+        <div class="small muted" style="margin:4px 0 8px">Estudo ${st.studyDone}/${st.studyPlan} min · Refeições ${st.mealsDone}/${st.mealsTotal} · ≈ ${fmtNum(st.kcal)} de ~${fmtNum(s.kcalTarget)} kcal</div>
         ${bar(st.studyPlan ? (st.studyDone / st.studyPlan) * 100 : 0, 'blue')}
         <div style="height:6px"></div>
-        ${bar(kpct, kpct > 110 ? 'warn' : '')}
+        ${bar(st.mealsTotal ? (st.mealsDone / st.mealsTotal) * 100 : 0)}
       </div>
     </div>
 
@@ -500,80 +498,6 @@ function bindHydration(day) {
     if (day.coffee > state.settings.coffeeMax) toast('Passou do limite de café de hoje');
     save(); render();
   });
-}
-
-// ------------------------------------------------------------------
-// Aba: Comida
-// ------------------------------------------------------------------
-function renderComida() {
-  const day = getDay(current);
-  const st = dayStats(current);
-  const s = state.settings;
-  const meals = st.items.filter((i) => i.cat === 'refeicao');
-  const planned = meals.reduce((a, m) => a + (day.kcal[m.id] != null ? day.kcal[m.id] : m.kcal), 0);
-  const left = s.kcalTarget - st.kcal;
-
-  $view.innerHTML = `
-    <div class="card">
-      <div class="row between"><div><div class="big">${fmtNum(st.kcal)}</div><div class="muted small">de ${fmtNum(s.kcalTarget)} kcal</div></div>
-        <div style="text-align:right"><div class="big" style="font-size:22px">${fmtNum(st.prot)} g</div><div class="muted small">de ${s.protTarget} g de proteína</div></div></div>
-      <div style="height:10px"></div>
-      ${bar((st.kcal / s.kcalTarget) * 100, st.kcal > s.kcalTarget * 1.1 ? 'warn' : '')}
-      <div style="height:6px"></div>
-      ${bar((st.prot / s.protTarget) * 100, 'blue')}
-      <div class="small muted" style="margin-top:8px">${left > 0 ? `Faltam ${fmtNum(left)} kcal` : `Meta batida (+${fmtNum(-left)} kcal)`} · plano do dia soma ${fmtNum(planned)} kcal</div>
-    </div>
-
-    <div class="card"><h3>Refeições do plano</h3>
-      ${meals.map((m) => {
-        const on = !!day.checks[m.id];
-        const k = day.kcal[m.id] != null ? day.kcal[m.id] : m.kcal;
-        return `<div class="meal">
-          <button class="check ${on ? 'on' : ''}" data-check="${m.id}">${on ? '✓' : ''}</button>
-          <div style="flex:1;min-width:0"><div class="title" style="font-weight:600">${m.t} · ${esc(m.title)}</div><div class="small muted">${esc(m.sub)}</div></div>
-          <button class="kcal" data-kcal="${m.id}" title="Toque para ajustar">${k}</button>
-        </div>`;
-      }).join('')}
-      <div class="small muted" style="margin-top:8px">Toque no número para ajustar as calorias se comeu diferente.</div>
-    </div>
-
-    <div class="card"><h3>Extras / fora do plano</h3>
-      ${(day.extras || []).map((e, idx) => `<div class="list-row"><span>${esc(e.name)} <span class="muted small">${e.prot ? e.prot + ' g prot.' : ''}</span></span>
-        <span class="row"><b>${fmtNum(e.kcal)} kcal</b><button class="btn small danger" data-del-extra="${idx}">✕</button></span></div>`).join('') || '<div class="muted small">Nada extra hoje.</div>'}
-      <div style="height:10px"></div>
-      <div class="field"><input type="text" id="exName" placeholder="Ex.: açaí, pizza, salgado"></div>
-      <div class="grid2">
-        <input type="number" inputmode="numeric" id="exKcal" placeholder="kcal">
-        <input type="number" inputmode="numeric" id="exProt" placeholder="proteína (g)">
-      </div>
-      <div style="height:10px"></div>
-      <div class="chips" style="margin-bottom:10px">
-        ${[['Pão francês', 135, 4], ['Banana', 90, 1], ['Ovo', 70, 6], ['Whey (dose)', 120, 24], ['Pasta amendoim (col.)', 95, 4], ['Leite 200 ml', 120, 6]].map(([n, k, p]) => `<button class="chip" data-quick="${esc(n)}|${k}|${p}">${n}</button>`).join('')}
-      </div>
-      <button class="btn primary block" id="exAdd">Adicionar</button>
-    </div>
-  `;
-
-  $view.querySelectorAll('[data-check]').forEach((b) => b.onclick = () => { day.checks[b.dataset.check] = !day.checks[b.dataset.check]; save(); render(); });
-  $view.querySelectorAll('[data-kcal]').forEach((b) => b.onclick = () => {
-    const id = b.dataset.kcal;
-    const v = prompt('Calorias desta refeição (deixe vazio para voltar ao padrão):', day.kcal[id] != null ? day.kcal[id] : MEALS[id].kcal);
-    if (v === null) return;
-    if (v.trim() === '') delete day.kcal[id]; else if (!isNaN(Number(v))) day.kcal[id] = Math.max(0, Math.round(Number(v)));
-    save(); render();
-  });
-  $view.querySelectorAll('[data-del-extra]').forEach((b) => b.onclick = () => { day.extras.splice(Number(b.dataset.delExtra), 1); save(); render(); });
-  $view.querySelectorAll('[data-quick]').forEach((b) => b.onclick = () => {
-    const [n, k, p] = b.dataset.quick.split('|');
-    day.extras.push({ name: n, kcal: Number(k), prot: Number(p) }); save(); render(); toast(`+${k} kcal`);
-  });
-  document.getElementById('exAdd').onclick = () => {
-    const name = document.getElementById('exName').value.trim();
-    const kcal = Number(document.getElementById('exKcal').value);
-    const prot = Number(document.getElementById('exProt').value) || 0;
-    if (!name || !kcal) { toast('Informe o nome e as kcal'); return; }
-    day.extras.push({ name, kcal: Math.round(kcal), prot: Math.round(prot) }); save(); render();
-  };
 }
 
 // ------------------------------------------------------------------
@@ -690,8 +614,7 @@ function renderSemana() {
   const q = sum((s) => s.q), a = sum((s) => s.a);
   const treinos = stats.filter((x) => x.s && x.s.treino).length;
   const leitura = sum((s) => s.leitura);
-  const kcalDays = stats.filter((x) => x.s && x.s.kcal > 0);
-  const kcalAvg = kcalDays.length ? Math.round(kcalDays.reduce((acc, x) => acc + x.s.kcal, 0) / kcalDays.length) : 0;
+  const mealsDone = sum((s) => s.mealsDone), mealsTotal = sum((s) => s.mealsTotal);
   const tracked = stats.filter((x) => x.s && x.k <= t);
   const avgPct = tracked.length ? Math.round(tracked.reduce((acc, x) => acc + x.s.pct, 0) / tracked.length) : 0;
   const famDays = stats.filter((x) => x.s && x.s.items.some((i) => i.id === 'familia') && state.days[x.k].checks.familia).length;
@@ -718,7 +641,7 @@ function renderSemana() {
         <div class="stat"><div class="v">${q}</div><div class="l">Questões · ${q ? Math.round((a / q) * 100) + '% de acerto' : 'sem registro'}</div></div>
         <div class="stat"><div class="v">${treinos}/6</div><div class="l">Treinos feitos</div>${bar((treinos / 6) * 100)}</div>
         <div class="stat"><div class="v">${fmtNum(leitura / 60, 1)} h</div><div class="l">Leitura (meta 7 h)</div>${bar((leitura / 420) * 100)}</div>
-        <div class="stat"><div class="v">${kcalAvg ? fmtNum(kcalAvg) : '–'}</div><div class="l">kcal média/dia (meta ${fmtNum(state.settings.kcalTarget)})</div></div>
+        <div class="stat"><div class="v">${mealsTotal ? Math.round((mealsDone / mealsTotal) * 100) + '%' : '–'}</div><div class="l">Refeições no horário (${mealsDone}/${mealsTotal})</div>${bar(mealsTotal ? (mealsDone / mealsTotal) * 100 : 0)}</div>
         <div class="stat"><div class="v">${famDays}/7</div><div class="l">Dias com tempo de família</div></div>
       </div>
     </div>
@@ -744,7 +667,7 @@ function checkinText(k) {
     `2. Blocos de estudo: ${blocos} (${st.studyDone}/${st.studyPlan} min)`,
     `3. Questões / acertos: ${st.q} / ${st.a}${st.q ? ` (${Math.round((st.a / st.q) * 100)}%)` : ''}`,
     `4. Treino: ${st.treino == null ? 'não previsto' : st.treino ? 'feito' : 'não feito'}`,
-    `5. Dieta (0 a 10): ${day.dieta ?? '—'} · ${fmtNum(st.kcal)} kcal · ${st.prot} g prot. · água ${fmtNum(day.water)} ml`,
+    `5. Dieta (0 a 10): ${day.dieta ?? '—'} · refeições ${st.mealsDone}/${st.mealsTotal} (≈ ${fmtNum(st.kcal)} kcal) · água ${fmtNum(day.water)} ml`,
     `6. Leitura: ${st.leitura} min`,
     `7. Tempo com a família: ${fam}`,
     `8. Nota do dia: ${day.nota ?? '—'} · ${day.obs ? 'O que atrapalhou: ' + day.obs : 'nada a relatar'}`,
@@ -802,8 +725,7 @@ function renderAjustes() {
   $view.innerHTML = `
     <div class="card"><h3>Metas</h3>
       <div class="grid2">
-        <div class="field"><label>Calorias/dia</label><input type="number" id="sK" value="${s.kcalTarget}"></div>
-        <div class="field"><label>Proteína/dia (g)</label><input type="number" id="sP" value="${s.protTarget}"></div>
+        <div class="field"><label>Calorias/dia (aprox.)</label><input type="number" id="sK" value="${s.kcalTarget}"></div>
         <div class="field"><label>Água/dia (ml)</label><input type="number" id="sW" value="${s.waterTarget}"></div>
         <div class="field"><label>Café máx. (ml)</label><input type="number" id="sC" value="${s.coffeeMax}"></div>
       </div>
@@ -830,7 +752,6 @@ function renderAjustes() {
   `;
   document.getElementById('sSave').onclick = () => {
     s.kcalTarget = Number(document.getElementById('sK').value) || DEFAULTS.kcalTarget;
-    s.protTarget = Number(document.getElementById('sP').value) || DEFAULTS.protTarget;
     s.waterTarget = Number(document.getElementById('sW').value) || DEFAULTS.waterTarget;
     s.coffeeMax = Number(document.getElementById('sC').value) || DEFAULTS.coffeeMax;
     s.provaNome = document.getElementById('sN').value.trim() || 'Prova';
@@ -864,7 +785,7 @@ function renderAjustes() {
 // ------------------------------------------------------------------
 function render() {
   renderHeader();
-  ({ hoje: renderHoje, comida: renderComida, peso: renderPeso, semana: renderSemana, checkin: renderCheckin, ajustes: renderAjustes })[tab]();
+  ({ hoje: renderHoje, peso: renderPeso, semana: renderSemana, checkin: renderCheckin, ajustes: renderAjustes })[tab]();
 }
 
 function setTab(t) {

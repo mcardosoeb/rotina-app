@@ -54,7 +54,7 @@ button { cursor: pointer; }
 /* Tab bar */
 .tabbar {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 10;
-  display: grid; grid-template-columns: repeat(5, 1fr);
+  display: grid; grid-template-columns: repeat(4, 1fr);
   padding: 6px 4px calc(var(--safe-bottom) + 6px);
   background: rgba(15, 23, 32, 0.96);
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
@@ -128,9 +128,6 @@ textarea { min-height: 70px; resize: vertical; }
 .chip.on { background: var(--accent2); border-color: var(--accent2); color: #04121f; font-weight: 700; }
 
 /* Meals */
-.meal { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
-.meal:last-child { border-bottom: 0; }
-.meal .kcal { font-weight: 700; font-variant-numeric: tabular-nums; background: none; border: 1px dashed var(--line); border-radius: 8px; padding: 4px 8px; }
 
 /* Chart */
 svg.chart { width: 100%; height: auto; display: block; }
