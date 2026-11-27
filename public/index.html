@@ -38,7 +38,7 @@
     <button data-tab="hoje" class="active"><span>☑</span>Hoje</button>
     <button data-tab="peso"><span>⚖</span>Peso</button>
     <button data-tab="semana"><span>📊</span>Semana</button>
-    <button data-tab="checkin"><span>✉</span>Check-in</button>
+    <button data-tab="coach"><span>💬</span>Coach</button>
   </nav>
 
   <div class="modal hidden" id="pinModal">
@@ -46,7 +46,12 @@
   </div>
 
   <input type="date" id="datePicker" class="hidden-date">
+  <div class="modal sheet hidden" id="sheet">
+    <div class="modal-card" id="sheetCard"></div>
+  </div>
+
   <div class="toast hidden" id="toast"></div>
+  <script src="/rotina-core.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

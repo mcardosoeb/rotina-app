@@ -14,6 +14,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const coach = require('./coach.js');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -33,7 +34,10 @@ const DAY = 24 * 60 * 60 * 1000;
 const REMEMBER_TTL = 90 * DAY;
 const SHORT_TTL = 12 * 60 * 60 * 1000;
 const DEVICE_TTL = 365 * DAY;
-const TICKET_TTL = 5 * 60 * 1000;
+const TICKET_TTL = 15 * 60 * 1000; // código 2FA (dá tempo de ir ao autenticador e voltar)
+const SETUP_TICKET_TTL = 30 * 60 * 1000;
+const PENDING_TOTP_TTL = 60 * 60 * 1000; // chave do 2FA ainda não confirmada continua a mesma por 1 h
+const COACH_DAILY_LIMIT = 60;
 const TICKET_MAX_TRIES = 5;
 const MAX_SESSIONS = 20;
 const MAX_DEVICES = 10;
@@ -228,6 +232,7 @@ function init() {
   }
   if (RESET_2FA) {
     auth.totp = null;
+    delete auth.pendingTotp;
     auth.recovery = [];
     auth.devices = [];
     auth.sessions = [];
@@ -367,9 +372,9 @@ function createDevice(req) {
 // Tickets: PIN correto aguardando o código 2FA (só em memória, 5 min)
 const tickets = new Map();
 
-function newTicket(data) {
+function newTicket(data, ttl = TICKET_TTL) {
   const t = crypto.randomBytes(24).toString('base64url');
-  tickets.set(sha256(t), { ...data, exp: Date.now() + TICKET_TTL, tries: 0 });
+  tickets.set(sha256(t), { ...data, exp: Date.now() + ttl, tries: 0 });
   return t;
 }
 
@@ -499,8 +504,15 @@ async function handleApi(req, res, url) {
       return finishLogin(req, res, remember);
     }
     if (!auth.totp) {
-      const secret = base32Encode(crypto.randomBytes(20));
-      const ticket = newTicket({ remember, setupSecret: secret });
+      // A chave pendente é reaproveitada: se o app reiniciar no meio da configuração,
+      // o autenticador já cadastrado continua valendo.
+      const now = Date.now();
+      if (!auth.pendingTotp || auth.pendingTotp.exp < now) {
+        auth.pendingTotp = { secret: base32Encode(crypto.randomBytes(20)), exp: now + PENDING_TOTP_TTL };
+        saveAuth();
+      }
+      const secret = auth.pendingTotp.secret;
+      const ticket = newTicket({ remember, setupSecret: secret }, SETUP_TICKET_TTL);
       const uri = `otpauth://totp/Rotina:Rotina%20App?secret=${secret}&issuer=Rotina&algorithm=SHA1&digits=6&period=30`;
       return json(req, res, 200, { step: 'setup', ticket, secret, uri });
     }
@@ -526,6 +538,7 @@ async function handleApi(req, res, url) {
       tickets.delete(t.k);
       const codes = newRecoveryCodes();
       auth.totp = { secret: t.v.setupSecret, lastStep: step, created: Date.now() };
+      delete auth.pendingTotp;
       auth.recovery = codes.map((c) => sha256(normRecovery(c)));
       console.log('2FA configurado.');
       return finishLogin(req, res, t.v.remember, { recoveryCodes: codes }, true);
@@ -578,6 +591,8 @@ async function handleApi(req, res, url) {
     return json(req, res, 200, { sessions: auth.sessions.length, devices: auth.devices.length, recoveryLeft: auth.recovery.length });
   }
 
+  if (p === '/api/coach' && req.method === 'POST') return handleCoach(req, res);
+
   if (p === '/api/state' && req.method === 'GET') {
     return json(req, res, 200, { state: readSecure(STATE_FILE, 'state').value });
   }
@@ -592,6 +607,57 @@ async function handleApi(req, res, url) {
   }
 
   return json(req, res, 404, { error: 'not_found' });
+}
+
+// ------------------------------------------------------------------
+// Coach (Claude)
+// ------------------------------------------------------------------
+let coachCalls = [];
+let coachRunning = false;
+
+async function handleCoach(req, res) {
+  const status = coach.coachStatus();
+  if (!status.ok) return json(req, res, 503, { error: 'coach_not_ready', message: status.message });
+  const now = Date.now();
+  coachCalls = coachCalls.filter((t) => now - t < DAY);
+  if (coachCalls.length >= COACH_DAILY_LIMIT) {
+    return json(req, res, 429, { error: 'coach_limit', message: `Limite de ${COACH_DAILY_LIMIT} mensagens ao coach por dia atingido.` });
+  }
+  if (coachRunning) return json(req, res, 409, { error: 'busy', message: 'O coach ainda está respondendo a mensagem anterior.' });
+  const body = await readJsonBody(req, 64 * 1024);
+  const message = body && typeof body.message === 'string' ? body.message.trim().slice(0, 6000) : '';
+  if (!message) return json(req, res, 400, { error: 'invalid', message: 'Mensagem vazia.' });
+  const today = body.today, hm = body.now;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today || '') || !/^\d{2}:\d{2}$/.test(hm || '')) {
+    return json(req, res, 400, { error: 'invalid', message: 'Data do aparelho inválida.' });
+  }
+  const checkinDate = /^\d{4}-\d{2}-\d{2}$/.test(body.checkinDate || '') ? body.checkinDate : null;
+  const state = readSecure(STATE_FILE, 'state').value;
+  if (!state || state.version !== 2 || !state.templates) {
+    return json(req, res, 409, { error: 'sync', message: 'Feche e abra o app para sincronizar a rotina antes de falar com o coach.' });
+  }
+  coachRunning = true;
+  coachCalls.push(now);
+  try {
+    const { reply, changes } = await coach.runCoach({ state, message, today, now: hm, isCheckin: !!checkinDate });
+    if (!state.coach || !Array.isArray(state.coach.messages)) state.coach = { messages: [] };
+    const ts = Date.now();
+    state.coach.messages.push({ role: 'user', text: message, ts, ...(checkinDate ? { kind: 'checkin' } : {}) });
+    state.coach.messages.push({ role: 'assistant', text: reply, ts: ts + 1, changes });
+    state.coach.messages = state.coach.messages.slice(-200);
+    if (checkinDate) {
+      if (!state.days[checkinDate]) state.days[checkinDate] = { type: 'seg', checks: {}, times: {}, water: 0, coffee: 0, q: '', a: '' };
+      state.days[checkinDate].checkinSent = true;
+    }
+    state.updatedAt = Date.now();
+    writeSecure(STATE_FILE, 'state', state);
+    return json(req, res, 200, { ok: true, reply, changes, state });
+  } catch (e) {
+    console.error('Coach:', e && e.message);
+    return json(req, res, 502, { error: 'coach', message: coach.friendlyError(e) });
+  } finally {
+    coachRunning = false;
+  }
 }
 
 // ------------------------------------------------------------------

@@ -11,5 +11,9 @@
     "node": ">=18"
   },
   "license": "UNLICENSED",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.332",
+    "@anthropic-ai/sdk": "^1.14.0"
+  }
 }

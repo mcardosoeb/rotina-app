@@ -105,7 +105,8 @@ function totp(secret, offset = 0) {
   ok(r.status === 401, 'só o PIN não dá acesso aos dados');
   r = await c.req('POST', '/api/login/verify', { ticket: setupTicket, code: '123456' });
   ok(r.status === 401 && r.data.error === 'code', 'código 2FA errado recusado');
-  r = await c.req('POST', '/api/login/verify', { ticket: setupTicket, code: totp(secret) });
+  const setupCode = totp(secret);
+  r = await c.req('POST', '/api/login/verify', { ticket: setupTicket, code: setupCode });
   ok(r.status === 200 && Array.isArray(r.data.recoveryCodes) && r.data.recoveryCodes.length === 8, '2FA ativado e 8 códigos de recuperação gerados');
   const recovery = r.data.recoveryCodes;
   ok(!!c.jar.rotina_sid && !!c.jar.rotina_dev, 'recebe cookie de sessão e de aparelho confiável');
@@ -132,7 +133,7 @@ function totp(secret, offset = 0) {
   r = await other.req('POST', '/api/login', { pin: PIN });
   ok(r.status === 200 && r.data.step === 'code' && !other.jar.rotina_sid, 'aparelho novo precisa do código 2FA');
   let t = r.data.ticket;
-  r = await other.req('POST', '/api/login/verify', { ticket: t, code: totp(secret) });
+  r = await other.req('POST', '/api/login/verify', { ticket: t, code: setupCode });
   ok(r.status === 401, 'código 2FA já usado não pode ser reutilizado (anti-replay)');
   r = await other.req('POST', '/api/login/verify', { ticket: t, code: recovery[0].toLowerCase() });
   ok(r.status === 200 && r.data.recoveryLeft === 7, 'código de recuperação funciona (restam 7)');
@@ -225,6 +226,109 @@ function totp(secret, offset = 0) {
   ok(r.status === 200, 'servidor continua de pé');
   const rb = await fetch(s.base + '/robots.txt').then((x) => x.text());
   ok(rb.includes('Disallow: /'), 'robots.txt bloqueia indexação');
+  await stop(s);
+
+  console.log('\n[12] 2FA: chave pendente sobrevive a reinício do app e do servidor');
+  s = await start({ RESET_2FA: '1' });
+  let d1 = client(s.base, '10.3.0.1');
+  r = await d1.req('POST', '/api/login', { pin: PIN });
+  const pendingSecret = r.data.secret;
+  ok(r.data.step === 'setup' && !!pendingSecret, 'configuração iniciada');
+  r = await client(s.base, '10.3.0.1').req('POST', '/api/login', { pin: PIN });
+  ok(r.data.secret === pendingSecret, 'novo login (app reiniciado) mostra a MESMA chave');
+  await stop(s);
+  s = await start({});
+  d1.base = s.base;
+  r = await d1.req('POST', '/api/login', { pin: PIN });
+  ok(r.data.step === 'setup' && r.data.secret === pendingSecret, 'mesma chave mesmo após reiniciar o servidor');
+  r = await d1.req('POST', '/api/login/verify', { ticket: r.data.ticket, code: totp(pendingSecret) });
+  ok(r.status === 200 && r.data.recoveryCodes, 'código do autenticador cadastrado antes do reinício ativa o 2FA');
+  const coachClient = d1;
+  await stop(s);
+
+  console.log('\n[13] Coach (com API do Claude simulada — sem custo)');
+  const http = require('http');
+  const core = require(path.join(APP, 'public', 'rotina-core.js'));
+  const seen = [];
+  const mock = http.createServer((q, w) => {
+    let b = '';
+    q.on('data', (c) => (b += c));
+    q.on('end', () => {
+      const body = JSON.parse(b);
+      seen.push({ url: q.url, headers: q.headers, body });
+      const last = body.messages[body.messages.length - 1];
+      const isToolResult = Array.isArray(last.content) && last.content[0] && last.content[0].type === 'tool_result';
+      const content = isToolResult
+        ? [{ type: 'text', text: 'Pronto: coloquei o dentista às 15:00 amanhã.' }]
+        : [{ type: 'tool_use', id: 'tu_1', name: 'upsert_event', input: { scope: 'dia', date: '2026-11-27', time: '15:00', title: 'Dentista', category: 'rotina' } },
+           { type: 'tool_use', id: 'tu_2', name: 'delete_event', input: { scope: 'dia', date: '2026-11-27', id: 'nao-existe' } }];
+      w.writeHead(200, { 'Content-Type': 'application/json' });
+      w.end(JSON.stringify({ id: 'msg_' + seen.length, type: 'message', role: 'assistant', model: body.model, content, stop_reason: isToolResult ? 'end_turn' : 'tool_use', stop_sequence: null, usage: { input_tokens: 10, output_tokens: 10 } }));
+    });
+  });
+  await new Promise((res) => mock.listen(0, res));
+  const mockUrl = `http://127.0.0.1:${mock.address().port}`;
+
+  s = await start({ ANTHROPIC_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', RAILWAY_ENVIRONMENT: 'production' });
+  coachClient.base = s.base;
+  r = await coachClient.req('POST', '/api/coach', { message: 'oi', today: '2026-11-26', now: '10:00' });
+  ok(r.status === 503 && /CLAUDE_CODE_OAUTH_TOKEN/.test(r.data.message), 'no Railway sem token o coach explica como configurar');
+  await stop(s);
+
+  s = await start({ ANTHROPIC_API_KEY: 'sk-teste', ANTHROPIC_BASE_URL: mockUrl });
+  coachClient.base = s.base;
+  r = await client(s.base, '10.3.0.9').req('POST', '/api/coach', { message: 'oi', today: '2026-11-26', now: '10:00' });
+  ok(r.status === 401, 'coach exige login');
+  r = await coachClient.req('POST', '/api/coach', { message: 'oi', today: '2026-11-26', now: '10:00' }, { Origin: 'https://evil.example' });
+  ok(r.status === 403, 'coach bloqueia outro site');
+  r = await coachClient.req('PUT', '/api/state', { state: { version: 1, updatedAt: 1, days: {}, weights: [] } });
+  r = await coachClient.req('POST', '/api/coach', { message: 'oi', today: '2026-11-26', now: '10:00' });
+  ok(r.status === 409, 'coach pede sincronização se os dados ainda estão no formato antigo');
+  const st2 = { version: 2, updatedAt: 2, settings: { kcalTarget: 3000, waterTarget: 3000, coffeeMax: 500, prova: '2026-12-13', provaNome: 'PMSC' }, templates: core.defaultTemplates(), days: {}, weights: [], coach: { messages: [] } };
+  r = await coachClient.req('PUT', '/api/state', { state: st2 });
+  r = await coachClient.req('POST', '/api/coach', { message: 'Amanhã tenho dentista às 15h', today: '2026-11-26', now: '10:00' });
+  ok(r.status === 200 && /dentista/i.test(r.data.reply), 'coach responde');
+  const day27 = r.data.state && r.data.state.days['2026-11-27'];
+  ok(day27 && day27.items && day27.items.some((i) => i.title === 'Dentista' && i.t === '15:00'), 'ferramenta do coach alterou só o dia 27/11');
+  ok(r.data.state.templates.sex.every((i) => i.title !== 'Dentista'), 'modelo das sextas não foi alterado');
+  ok(r.data.changes.length === 1, 'erro de ferramenta (id inexistente) não quebra a conversa');
+  ok(r.data.state.coach.messages.length === 2, 'conversa salva no histórico');
+  const firstReq = seen[0];
+  ok(firstReq.body.model === 'claude-opus-5-5' && firstReq.body.tools.length === 4, 'usa claude-opus-5-5 com as 4 ferramentas');
+  ok(firstReq.headers['x-api-key'] === 'sk-teste' || String(firstReq.headers.authorization || '').includes('sk-teste'), 'a chave fica só no servidor', JSON.stringify(Object.keys(firstReq.headers)));
+  ok(String(firstReq.body.messages.at(-1).content).includes('<contexto>'), 'envia a rotina como contexto');
+  const toolResults = seen[1].body.messages.at(-1).content;
+  ok(toolResults.length === 2 && toolResults[1].is_error === true, 'devolve os 2 resultados juntos, com o erro marcado');
+  const rawState = fs.readFileSync(path.join(DATA, 'state.json'), 'utf8');
+  ok(!rawState.includes('Dentista'), 'conversa e rotina continuam criptografadas no disco');
+  r = await coachClient.req('POST', '/api/coach', { message: 'check', today: '2026-11-27', now: '08:00', checkinDate: '2026-11-26' });
+  ok(r.status === 200 && r.data.state.days['2026-11-26'].checkinSent === true, 'check-in marcado como enviado');
+  await stop(s);
+  mock.close();
+
+  console.log('\n[14] Coach pela assinatura (Claude Code com CLAUDE_CODE_OAUTH_TOKEN — sem custo por mensagem)');
+  const fakeCli = path.join(__dirname, 'fake-claude.js');
+  const logFile = path.join(DATA, 'fake-claude-log.json');
+  const cliEnv = { ANTHROPIC_API_KEY: '', CLAUDE_CLI: fakeCli, FAKE_CLAUDE_LOG: logFile, CLAUDE_CODE_OAUTH_TOKEN: 'tok-assinatura', RAILWAY_ENVIRONMENT: 'production' };
+  s = await start(cliEnv);
+  coachClient.base = s.base;
+  r = await coachClient.req('POST', '/api/coach', { message: 'Encaixe uma revisão hoje à noite', today: '2026-11-26', now: '18:00' });
+  ok(r.status === 200 && /revisão/i.test(r.data.reply), 'coach responde pelo Claude Code', JSON.stringify(r.data).slice(0, 200));
+  const d26 = r.data.state && r.data.state.days['2026-11-26'];
+  ok(d26 && d26.items && d26.items.some((i) => i.title === 'Revisão rápida' && i.t === '20:30' && i.min === 20), 'ação do JSON aplicada na rotina do dia');
+  ok(r.data.changes.length === 1 && /Não consegui aplicar 1/.test(r.data.reply), 'ação inválida é ignorada e avisada na resposta');
+  const log = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+  const argAt = (flag) => log.args[log.args.indexOf(flag) + 1];
+  ok(log.args[0] === '-p' && argAt('--output-format') === 'json' && argAt('--tools') === '', 'roda claude -p, saída JSON e sem ferramentas do Claude Code');
+  ok(argAt('--json-schema') && JSON.parse(argAt('--json-schema')).required.includes('actions'), 'pede resposta estruturada (reply + actions)');
+  ok(log.args.includes('--no-session-persistence') && log.args.includes('--strict-mcp-config'), 'não salva sessão nem carrega MCP');
+  ok(log.token === 'tok-assinatura' && !log.hasApiKey && !log.hasBaseUrl, 'usa o token da assinatura, sem chave de API nem proxy herdados');
+  ok(log.input.includes('<contexto>') && log.input.includes('CONVERSA ANTERIOR'), 'envia contexto da rotina e histórico da conversa');
+  await stop(s);
+  s = await start({ ...cliEnv, FAKE_CLAUDE_MODE: 'login' });
+  coachClient.base = s.base;
+  r = await coachClient.req('POST', '/api/coach', { message: 'oi', today: '2026-11-26', now: '18:00' });
+  ok(r.status === 502 && /setup-token/.test(r.data.message), 'token inválido/expirado gera mensagem clara');
   await stop(s);
 
   console.log(`\nResultado: ${pass} OK, ${fail} falha(s)`);
